@@ -1,0 +1,1388 @@
+---
+title: "tree.naturalization_extinction"
+author: "Kun"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# 0 packages
+
+```{r}
+library(tidyverse)
+library(ggExtra)
+library(ggrepel)
+library(data.table)
+library(FactoMineR)
+library(ggh4x)
+library(ggdensity)
+library(conflicted)
+library(scattermore)
+library(ape)
+library(scales)
+library(phytools)
+library(purrr)
+library(cowplot)
+library(randomForest)
+library(adegenet) #for DAPC
+library(furrr)
+library(ggforce)
+library(ggh4x)
+library(scico)
+library(patchwork)
+library(TPD)
+library(vegan)
+library(metR) # for contour label, but there are too much decimal
+library(geomtextpath) # for contour label
+library(conflicted)
+
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(purrr::map)
+
+source("merged_fun.R") # functions for TPD calculation, obtained from Carlos P. et al. 2021, Science Advances 7(13): eabf2675.
+
+```
+
+# 1 prepare data
+
+```{r}
+tree_phy <- readRDS("tree_phy202502.RDS")
+tree_gtc16_group_final <- readRDS("df202502.RDS")
+
+extrisk <- fread("Angiosperm_extinction_risk_predictions_v1.csv") |> 
+  mutate(taxon_name = str_replace_all(taxon_name, " ", "_"))
+extrisk
+
+tree_gtc16_group_final |> count(red_naturalized) #41835 species
+tree_gtc16_group_final |> count(IUCN.category)
+
+tree_gtc16_group_final |> 
+  filter(red_naturalized == "missing") |> 
+  left_join(select(extrisk, taxon_name, combined, confidence, category, observed_threat),
+            by = c("species" = "taxon_name")) |> 
+  count(combined, confidence)
+
+#         combined     confidence    n
+# 1 not threatened      confident 6383
+# 2 not threatened low_confidence 1025
+# 3     threatened      confident 5342
+# 4     threatened low_confidence 1327
+# 5           <NA>           <NA>  990
+
+# delete species with missing red status or low_confidence
+tree_gtc16_group_final1 <- extrisk |>
+  select(taxon_name, combined, confidence, category, observed_threat) |>
+  filter(confidence == "confident") |>
+  mutate(combined = ifelse(combined == "not threatened",
+                           "non_threatened", combined)) |>
+  right_join(tree_gtc16_group_final, by = c("taxon_name" = "species")) |>
+  # finalize red_naturalized
+  mutate(red_naturalized1 = ifelse(red_naturalized == "missing", combined, red_naturalized)) |>
+  filter(!is.na(red_naturalized1)) # 38493
+
+tree_gtc16_group_final1 |> count(red_naturalized1)
+
+tree_gtc16_group_final1 |>
+  mutate(use_sum = replace_na(use_sum, 0)) |>
+  select(taxon_name,
+         red_naturalized1,
+         all_of(vul.nm)) |>
+  filter(red_naturalized1 != "threatened") |> #2000 species have no data on change rate
+  na.omit()
+##########################
+# Finalize data
+# all species must have information on red_naturalized1 species
+# for naturalized and non-threatened species, they must have data on vulnerability, ecouse and area, so that naturalized-alike species can be obtained.
+
+
+tree_gtc16_group_final2 <- tree_gtc16_group_final1 |> 
+  mutate(use_sum = replace_na(use_sum, 0)) |>
+  filter(!if_any(VegMaxHeight:LA, ~ is.na(.x))) |> 
+  filter(!if_any(c(annualPET:growingDegDays5, maxTempColdest:tri), ~ is.na(.x) )) |> 
+  # delete those with missing area
+  filter(!is.na(area)) |> 
+  # delete those are non_threatened or naturalized but with missing vlunerability
+  mutate(tmp = (red_naturalized1 != "threatened") * (is.na(slope_vpd)) ) |> 
+  filter(tmp ==0)  
+  # select(taxon_name, red_naturalized1, IUCN.category, 26:32, 40:69, 72:90)
+tree_gtc16_group_final2 |> count(red_naturalized1)
+tree_gtc16_group_final2 |> count(red_naturalized, red_naturalized1, IUCN.category)
+
+tree_gtc16_group_final2 |> dim()
+
+
+# for those are threatened or non_threatened based GTC (?)
+tree_gtc16_group_final2 |> 
+  select(taxon_name, red_naturalized, red_naturalized1, IUCN.category) |> 
+  filter(red_naturalized1 %in% c("non_threatened", "threatened")) |> 
+  filter( IUCN.category %in% c("DD", "NE") | is.na(IUCN.category))
+
+```
+
+# 2 data analyses for current species list
+
+## 2.1 PCA models
+
+```{r}
+col_final <- c(threatened ="#DC0000FF", non_threatened = "gray", naturalized = "#3C5488FF") 
+grp <- c("non_threatened", "threatened", "naturalized") 
+
+names(tree_gtc16_group_final2)
+trait.nm <- names(tree_gtc16_group_final2)[26:33]
+treeGEOR.nm <-  names(tree_gtc16_group_final2)[c(40:69, 72:90)]
+# variables used for predicting naturalized-like species
+vul.nm <- names(tree_gtc16_group_final2)[c(24:25, 93:101)]
+
+df4pca <- tibble(group = c("trait", "treeGEOR"),
+                 nm = list(trait.nm, treeGEOR.nm)) |> 
+  # generate data 
+  mutate(df = map(nm, function(tmp){
+    tmp.df <- tree_gtc16_group_final2 |>
+      select(taxon_name,
+             red_naturalized1,
+             all_of(tmp))
+    # delete NAs
+    # tmp.df1 <- na.omit(tmp.df)
+  }))
+
+df4pca$df[[1]] |> dim()
+# phylogentic tree
+tree_phy.f <- drop.tip(tree_phy, setdiff(tree_phy$tip.label, df4pca$df[[1]]$taxon_name))
+# 31003 species
+# 18 species were misisng from the tree
+miss.tree.nm <- setdiff(df4pca$df[[1]]$taxon_name, tree_phy.f$tip.label)
+# delete those species from data
+df4pca1 <- df4pca |> 
+  mutate(df = map(df, ~ filter(.x, !(taxon_name %in% miss.tree.nm))))
+df4pca1$df[[1]] |> dim()
+df4pca1$df[[1]] |> count(red_naturalized1)
+######################
+# conduct PCA
+df4pca2 <- df4pca1 |> 
+  mutate(pca = map(df, ~ PCA(.x[, -(1:2)], graph = F))) |>
+  mutate(pc.variance = map(pca, ~ .x$eig)) |> 
+  mutate(pc12 = map2(pca, df, ~ as.data.frame(.x$ind$coord[,1:2]) |> bind_cols(.y[, 1:2]))) |>
+  mutate(arrow12 = map(pca, ~ as.data.frame(.x$var$coord) |> rownames_to_column(var = "var"))) |> 
+  mutate(arrow12.cor = map(pca, ~ as.data.frame(.x$var$cor) |> rownames_to_column(var = "var"))) |> 
+  # select those with cor >= 0.7
+  mutate(cor.thresh = c(0.75, 0.75, 0.8)) |> 
+  mutate(arrow12.cor.tmp = map2(arrow12.cor, cor.thresh,
+                               ~ mutate(.x, tmp = (abs(Dim.1) >=.y) + (abs(Dim.2) >=.y)) |> 
+                                 filter(tmp >= 1) |> 
+                                 pull(var)) ) |> 
+  mutate(arrow12.f = map2(arrow12, arrow12.cor.tmp, ~ filter(.x, var %in% .y))) |> 
+  # multiple a value to extend arrow length
+  mutate(arrow12.fct = c(6, 12, 5)) |> 
+  mutate(arrow12.f = map2(arrow12.f, arrow12.fct, ~ mutate(.x, Dim.1 = Dim.1 * .y, 
+                                                           Dim.2 = Dim.2 * .y)))
+
+##############
+df4pca2 |> 
+  select(group, pc.variance) |> 
+  unnest(pc.variance)
+
+df4pca2 |> 
+  select(group, arrow12.cor) |> 
+  unnest(arrow12.cor) |> print(n = 70)
+
+
+
+df4pca2$pca[[1]]$eig
+df4pca2$pca[[1]]$ind$coord
+df4pca2$pca[[1]]$var$coord |> as.data.frame()
+
+```
+
+## 2.1 PCA plot/summary for trait
+
+```{r}
+df4pca2
+df4pca2$arrow12.cor.tmp
+df4pca2$pc.variance[[1]]
+##PCA summary
+df4pca2 |> 
+  filter(group != "vul") |> 
+  select(group, pc.variance) |> 
+  mutate(pc.variance = map(pc.variance, as.data.frame)) |> 
+  mutate(pc.variance = map(pc.variance, ~ slice(.x, 1:2))) |> 
+  unnest(pc.variance) |> 
+  fwrite("./res/pca.variance.csv", row.names = F)
+
+df4pca2 |> 
+  filter(group != "vul") |> 
+  select(group, arrow12.cor) |> 
+  mutate(arrow12.cor = map(arrow12.cor, as.data.frame)) |> 
+  unnest(arrow12.cor) |> 
+  fwrite("./res/pca.arrow12.csv", row.names = F)
+
+################################
+trait.space.p <- df4pca2$pc12[[1]] |> 
+  mutate(red_naturalized1 = factor(red_naturalized1, levels = grp)) |> 
+  arrange(red_naturalized1) |> 
+  ggplot(aes(x = Dim.1, y = Dim.2)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  # geom_point(aes(color = red_naturalized1, shape=red_naturalized1, size = red_naturalized1),
+  #           alpha = 0.5, size = 1) +
+  geom_point_rast(aes(color = red_naturalized1, shape=red_naturalized1, size = red_naturalized1),
+            alpha = 0.5, size = 1) +
+  # add arrows
+  geom_segment(
+    data = df4pca2$arrow12.f[[1]],
+    aes(
+      x = 0,
+      y = 0,
+      xend = Dim.1,
+      yend = Dim.2
+    ),
+    arrow = arrow(length = unit(0.2, "cm")),
+    colour = "black"
+  ) +
+  # add arrow labels
+  geom_text_repel(
+    data =  df4pca2$arrow12.f[[1]],
+    aes(
+      x = Dim.1,
+      y = Dim.2,
+      label = var
+    ),
+    size = 2
+  ) +
+  geom_point(data = df4pca2$pc12[[1]] |> 
+               group_by(red_naturalized1) |> 
+               summarise(Dim.1 = mean(Dim.1), Dim.2 = mean(Dim.2)), 
+             aes(fill = red_naturalized1),
+             shape = 21, color = "white", size = 2
+             )+
+  scale_color_manual(values = col_final) +
+  scale_fill_manual(values = col_final) +
+  xlim(c(-8, 8)) +
+  ylim(c(-5, 7)) +
+  xlab(paste0("PC1 (", 
+              df4pca2$pc.variance[[1]][,2][1] |> 
+                percent(scale = 1, accuracy = 0.01), ")")) +
+   ylab(paste0("PC2 (", 
+              df4pca2$pc.variance[[1]][,2][2] |> 
+                percent(scale = 1, accuracy = 0.01), ")")) +
+  #scale_shape_manual(values =  c(threatened = 21, non_threatened = 19, naturalized = 21) )+
+  scale_shape_manual(values =  c(threatened = 21, non_threatened = 19, naturalized = 21) )+
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none"
+  ) +
+  theme(panel.background = element_rect(fill = NA, color = "grey")) +
+  theme(axis.ticks = element_line())
+
+trait.space.p
+
+```
+
+## 2.2 environmental PCA plot
+
+```{r}
+treeGEOR.space.p <- df4pca2$pc12[[2]] |> 
+  mutate(red_naturalized1 = factor(red_naturalized1, levels = grp)) |> 
+  arrange(red_naturalized1) |> 
+  ggplot(aes(x = Dim.1, y = Dim.2, group = red_naturalized1)) +
+  # add arrows
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  # geom_point(aes(color = red_naturalized1, shape=red_naturalized1, size = red_naturalized1),
+  #           alpha = 0.5, size = 1) +
+  geom_point_rast(aes(color = red_naturalized1, shape=red_naturalized1, size = red_naturalized1),
+            alpha = 0.5, size = 1) +
+  geom_segment(
+    data = df4pca2$arrow12.f[[2]],
+    aes(
+      x = 0,
+      y = 0,
+      xend = Dim.1,
+      yend = Dim.2
+    ),
+    arrow = arrow(length = unit(0.2, "cm")),
+    colour = "black",
+    inherit.aes = F
+  ) +
+  # add arrow labels
+  geom_text_repel(
+    data =  df4pca2$arrow12.f[[2]],
+    aes(
+      x = Dim.1,
+      y = Dim.2,
+      label = var
+    ),
+    size = 2,
+    inherit.aes = F
+  ) +
+  geom_point(data = df4pca2$pc12[[2]] |>
+               group_by(red_naturalized1) |>
+               summarise(Dim.1 = mean(Dim.1), Dim.2 = mean(Dim.2)),
+             aes(fill = red_naturalized1),
+             shape = 21, color = "white", size = 2)+
+  scale_color_manual(values = col_final) +
+  scale_fill_manual(values = col_final) +
+  # scale_x_continuous(limits = c(-24, 12)) + #you can change if need
+  # scale_y_continuous(limits = c(-15, 12)) +
+  xlab(paste0("PC1 (", 
+              df4pca2$pc.variance[[2]][,2][1] |> 
+                percent(scale = 1, accuracy = 0.01), ")")) +
+   ylab(paste0("PC2 (", 
+              df4pca2$pc.variance[[2]][,2][2] |> 
+                percent(scale = 1, accuracy = 0.01), ")")) +
+  scale_shape_manual(values =  c(threatened = 21, non_threatened = 19, naturalized = 21) )+
+  # scale_size_manual(values =  c(threatened = 3, non_threatened = 3, naturalized = 3.5) )+
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "none"
+  ) +
+  theme(panel.background = element_rect(fill = NA, color = "grey")) +
+  theme(axis.ticks = element_line())
+treeGEOR.space.p
+
+```
+
+## 2.3 ggridge plots (refined Fig.1)
+
+```{r}
+df4pca2$pc12[[2]] |> 
+  mutate(red_naturalized1 = factor(red_naturalized1, levels = grp)) |> 
+  arrange(red_naturalized1) |> 
+  pivot_longer(cols = Dim.1:Dim.2, names_to = "Dim", values_to = "val") |> 
+  ggplot(aes(x = val, y = red_naturalized1, fill = stat(x)))+
+  geom_density_ridges_gradient(scale = 5, rel_min_height = 0.01)+
+  scale_fill_viridis_c(option = "C")+
+  facet_wrap(. ~ Dim, scales = "free_x") +
+  theme_minimal()
+
+trait.density.p <- df4pca2$pc12[[1]] |> 
+  mutate(red_naturalized1 = factor(red_naturalized1, levels = grp)) |> 
+  arrange(red_naturalized1) |> 
+  pivot_longer(cols = Dim.1:Dim.2, names_to = "Dim",
+               values_to = "val") |> 
+  ggplot(aes(x = val, y = red_naturalized1, 
+                 fill = factor(stat(quantile)) ))+
+  stat_density_ridges(
+    geom = "density_ridges_gradient", 
+    calc_ecdf = TRUE,
+    quantiles = c(0.1, 0.5, 0.9), 
+    # color = NA,
+    quantile_lines = F
+  ) +
+  xlab(NULL) +
+  ylab(NULL) +
+  facet_wrap2(. ~ Dim, scales = "free", nrow = 2,
+              strip.position = "bottom") +
+  facetted_pos_scales(x = list(Dim.1 = scale_x_continuous(limits = c(-8, 8)),
+                               Dim.2 = scale_x_continuous(limits = c(-5, 7))))+
+  scale_fill_viridis_d(name = "Probability",
+                       option = "E",
+                       labels = c("(0, 0.1]", 
+                                  "(0.1, 0.5]", 
+                                  "(0.5, 0.9]",
+                                  "(0.9, 1]") ) +
+  theme_minimal() +
+  theme(strip.placement = "outside") +
+  theme(panel.background = element_rect(fill = NA, color = "grey"))
+
+
+df4pca2$pc12[[1]] |> 
+  mutate(red_naturalized1 = factor(red_naturalized1, levels = grp)) |> 
+  pivot_longer(cols = Dim.1:Dim.2, names_to = "Dim", values_to = "val") |>
+  group_by(red_naturalized1, Dim) |>
+  summarise(max = max(val), min = min(val)) |> 
+  arrange(Dim, red_naturalized1)
+###################################
+# environmental space
+treeGEOR.density.p <-df4pca2$pc12[[2]] |> 
+  mutate(red_naturalized1 = factor(red_naturalized1, levels = grp)) |> 
+  arrange(red_naturalized1) |> 
+  pivot_longer(cols = Dim.1:Dim.2, names_to = "Dim",
+               values_to = "val") |> 
+  ggplot(aes(x = val, y = red_naturalized1, 
+                 fill = factor(stat(quantile)) ))+
+  stat_density_ridges(
+    geom = "density_ridges_gradient", 
+    calc_ecdf = TRUE,
+    quantiles = c(0.1, 0.5, 0.9), 
+    # color = NA,
+    quantile_lines = F
+  ) +
+  xlab(NULL) +
+  ylab(NULL) +
+  facet_wrap2(. ~ Dim, scales = "free", nrow = 2,
+              strip.position = "bottom") +
+  # facetted_pos_scales(x = list(Dim.1 = scale_x_continuous(limits = c(-8, 8)),
+  #                              Dim.2 = scale_x_continuous(limits = c(-5, 7))))+
+  scale_fill_viridis_d(name = "Probability",
+                       option = "E",
+                       labels = c("(0, 0.1]", 
+                                  "(0.1, 0.5]", 
+                                  "(0.5, 0.9]",
+                                  "(0.9, 1]") ) +
+  theme_minimal() +
+  theme(strip.placement = "outside") +
+  theme(panel.background = element_rect(fill = NA, color = "grey"))
+##############################
+pdf("trait&env.p.pdf", width = 12, height = 8)
+# (trait.space.p | trait.density.p) / (treeGEOR.space.p | env.density.p)
+plot_grid(plotlist = list(trait.space.p, trait.density.p, treeGEOR.space.p, treeGEOR.density.p),
+          nrow = 2, align = "hv"
+          )
+dev.off()
+
+################
+# summary for the four Quadrants
+df4pca2 |> 
+  slice(1:2) |> 
+  select(group, pc12) |> 
+  unnest(pc12) |> 
+  select(-taxon_name) |> 
+  mutate(Quadrant = case_when((Dim.1 >= 0 & Dim.2 >= 0) ~ "Quadrant1",
+                         (Dim.1 < 0 & Dim.2 > 0) ~ "Quadrant2",
+                         (Dim.1 < 0 & Dim.2 < 0) ~ "Quadrant3",
+                         (Dim.1 > 0 & Dim.2 < 0) ~ "Quadrant4",
+                         )) |> 
+  group_by(group, Quadrant, red_naturalized1) |> 
+  summarise(n = n()) |> 
+  group_by(group, red_naturalized1) |> 
+  mutate(n_status = sum(n)) |> 
+  mutate(perc = n/n_status*100) |> 
+  mutate(red_naturalized1 = fct(red_naturalized1, 
+                                levels = c("naturalized", "threatened", "non_threatened"))) |> 
+  arrange(group, Quadrant, red_naturalized1) |> 
+  print(n = 24)
+
+```
+
+## 2.4 phyloANOVA
+
+```{r}
+tree_phy.f$tip.label[1:10]
+df4pca2$pc12[[1]]$taxon_name[1:10]
+df4pca3$pc12[[1]]$taxon_name[1:10]
+
+df4pca2$pc12[[1]]
+df4pca3 <- df4pca2 |> 
+  mutate(phylo.aov = map(pc12, function(tmp){
+    row.names(tmp) <- tmp$taxon_name
+    tmp <- tmp[tree_phy.f$tip.label, ]
+    phyaov <- map(c(Dim.1 = "Dim.1", Dim.2 = "Dim.2"), function(nm){
+       y <- tmp[, nm]
+       names(y) <- row.names(tmp)
+       x <- tmp$red_naturalized1
+       names(x) <- row.names(tmp)
+      phylANOVA(tree_phy.f, x, y, nsim=1000, posthoc=TRUE, p.adj="bonferroni")
+    })
+  }))
+(df4pca3$phylo.aov[[1]] |> walk(print)) #PC1 & PC2, no significant differences
+# PC1:
+# Pairwise corrected P-values:
+#                naturalized non_threatened threatened
+# naturalized          1.000          0.567      0.180
+# non_threatened       0.567          1.000      0.132
+# threatened           0.180          0.132      1.000
+
+#PC2
+# Pairwise corrected P-values:
+#                naturalized non_threatened threatened
+# naturalized          1.000          0.828      1.000
+# non_threatened       0.828          1.000      0.774
+# threatened           1.000          0.774      1.000
+
+#################
+(df4pca3$phylo.aov[[2]] |> walk(print)) #PC1: naturalized species differed from non_threatened adn threatened species; But for PC2, only threatened species differed from naturalized and non_threateneded species
+
+#PC1
+# Pairwise corrected P-values:
+#                naturalized non_threatened threatened
+# naturalized          1.000          0.003      0.003
+# non_threatened       0.003          1.000      1.000
+# threatened           0.003          1.000      1.000
+
+#PC2
+# Pairwise corrected P-values:
+#                naturalized non_threatened threatened
+# naturalized          1.000          0.843      0.033
+# non_threatened       0.843          1.000      0.003
+# threatened           0.033          0.003      1.000
+```
+
+## 2.5 Current TPD
+
+### 2.5.1 current trait TPD
+
+```{r}
+df4pca$df[[1]]
+df4pca2
+
+df4pca2$pc12[[1]]
+dimensions <- 2
+gridSize <- 200
+traitsUSE <- df4pca2$pc12[[1]][, 1:2]
+row.names(traitsUSE) <- df4pca2$pc12[[1]]$taxon_name
+sdTraits <- sqrt(diag(Hpi.diag(traitsUSE)))
+trait_TPDs <- TPDsMean(species = rownames(traitsUSE), 
+                          means = traitsUSE, 
+                          sds = matrix(rep(sdTraits, nrow(traitsUSE)), byrow=T, ncol=dimensions),
+                          alpha = 0.95,
+                          n_divisions = gridSize)
+# saveRDS(trait_TPDs, file = "trait_TPDs.RDS")
+
+# trait_TPDs <- readRDS("trait_TPDs.RDS")
+trait_TPDs$TPDs$Sophora_tetraptera
+
+grpComm <- df4pca2$pc12[[1]][, 3:4] |> 
+  mutate(tmp = 1) |> 
+  pivot_wider(names_from = taxon_name, values_from = tmp, values_fill = 0) |> 
+  as.data.frame()
+grpComm <- grpComm[c(1:3,3), ]
+grpComm[4, 1] <- "all"
+grpComm[4, -1] <- rep(1, ncol(grpComm)-1)
+row.names(grpComm) <- grpComm$red_naturalized1
+grpComm <-as.matrix(grpComm[,-1])  
+
+grpComm |> dim()
+grpComm[, 1:6]
+trait_TPDc <- TPDc(TPDs = trait_TPDs, sampUnit = grpComm)
+# saveRDS(trait_TPDc, file = "trait_TPDc.RDS")
+# trait_TPDc <- readRDS("trait_TPDc.RDS")
+# functional richness
+trait_Richness <- REND(trait_TPDc)
+trait_Richness
+redundancy(trait_TPDc)
+
+###overlap-based functional dissimilarity
+trait_dis <- dissim(trait_TPDc)
+trait_dis
+
+# $communities
+# $communities$dissimilarity
+#                non_threatened threatened naturalized        all
+# non_threatened     0.00000000 0.12928938   0.2323975 0.03682743
+# threatened         0.12928938 0.00000000   0.2959822 0.09573354
+# naturalized        0.23239750 0.29598222   0.0000000 0.23566640
+# all                0.03682743 0.09573354   0.2356664 0.00000000
+# 
+# $communities$P_shared
+#                non_threatened threatened naturalized all
+# non_threatened             NA  0.9805895   0.9536712   1
+# threatened          0.9805895         NA   0.9236557   1
+# naturalized         0.9536712  0.9236557          NA   1
+# all                 1.0000000  1.0000000   1.0000000  NA
+# 
+# $communities$P_non_shared
+#                non_threatened threatened naturalized all
+# non_threatened             NA 0.01941047  0.04632881   0
+# threatened         0.01941047         NA  0.07634427   0
+# naturalized        0.04632881 0.07634427          NA   0
+# all                0.00000000 0.00000000  0.00000000  NA
+
+trait_TPDc$TPDc$RTPDs
+trait_TPDc$TPDc$RTPDs$all
+plotTPD(trait_TPDc)
+
+trait1Edges <- unique(trait_TPDc$data$evaluation_grid[, 1])
+trait2Edges <- unique(trait_TPDc$data$evaluation_grid[, 2])
+imageMat <- imageTPD(trait_TPDc, thresholdPlot = 0.9999)
+imageMat1 <- imageMat |> 
+  as.data.frame() |> 
+  rownames_to_column(var = "x") |> 
+  pivot_longer(cols = -contains("x"), names_to = "tmp", values_to = "z") |> 
+  filter(!is.na(z)) |> 
+  separate(col = tmp, into = c("y", "grp"), sep = "\\.(?=[^.]+$)") |> 
+  mutate(x = as.numeric(x), y = as.numeric(y))
+  
+imageMat1 |> 
+  filter(grp == "all") |> 
+  ggplot(aes(x = x, y = y, z = z)) +
+  geom_density_2d(color = "black") +
+  scale_x_continuous(name = "Trait 1") +
+  scale_y_continuous(name = "Trait 2") +
+  theme_minimal() +
+
+# par(mfrow = c(1, 3))
+# map(c("threatened", "non_threatened", "naturalized"), function(nm){
+#   image(x=trait1Edges, y=trait2Edges, z=imageMat[, , nm], 
+#          xaxs="r", yaxs="r",  
+#       main = nm,
+#       xlim = c(-8, 8), ylim = c(-5, 5),
+#       asp = 1,cex.lab=2.5)
+#   contour(x=trait1Edges, y=trait2Edges, z=imageMat[, , nm], levels=0.5,
+#           drawlabels = F, lwd = 2, col="white", add=T)
+#   contour(x=trait1Edges, y=trait2Edges, z=imageMat[, , "all"], levels=0.99,
+#          drawlabels = F, lwd = 2, col="blue", add=T)
+#   
+# })
+# par(mfrow = c(1, 1))
+
+
+```
+
+## 2.5.2 current environmental TPD
+
+```{r}
+envUSE <- df4pca2$pc12[[2]][, 1:2]
+row.names(envUSE) <- df4pca2$pc12[[2]]$taxon_name
+sdEnv <- sqrt(diag(Hpi.diag(envUSE)))
+env_TPDs <- TPDsMean(species = rownames(envUSE), 
+                          means = envUSE, 
+                          sds = matrix(rep(sdEnv, nrow(envUSE)), byrow=T, ncol=dimensions),
+                          alpha = 0.95,
+                          n_divisions = gridSize)
+saveRDS(env_TPDs, file = "env_TPDs.RDS")
+env_TPDs$TPDs$Sophora_tetraptera
+
+grpComm <- df4pca2$pc12[[1]][, 3:4] |> 
+  mutate(tmp = 1) |> 
+  pivot_wider(names_from = taxon_name, values_from = tmp, values_fill = 0) |> 
+  as.data.frame()
+grpComm <- grpComm[c(1:3,3), ]
+grpComm[4, 1] <- "all"
+grpComm[4, -1] <- rep(1, ncol(grpComm)-1)
+row.names(grpComm) <- grpComm$red_naturalized1
+grpComm <-as.matrix(grpComm[,-1])  
+
+grpComm |> dim()
+grpComm[, 1:6]
+env_TPDc <- TPDc(TPDs = env_TPDs, sampUnit = grpComm)
+# saveRDS(env_TPDc, file = "env_TPDc.RDS")
+# env_TPDc <- readRDS("env_TPDc.RDS")
+plotTPD(env_TPDc)
+
+# functional richness
+env_Richness <- REND(env_TPDc)
+env_Richness
+redundancy(env_TPDc)
+# 
+# $richness
+# non_threatened     threatened    naturalized            all 
+#          19828           9522           1633          30983 
+# 
+# $redundancy
+# non_threatened     threatened    naturalized            all 
+#      384.91357      170.30134       27.07552      543.98387 
+# 
+# $redundancyRelative
+# non_threatened     threatened    naturalized            all 
+#     0.01941361     0.01788692     0.01659039     0.01755806 
+
+###overlap-based functional dissimilarity
+env_dis <- dissim(env_TPDc)
+env_dis
+# $communities
+# $communities$dissimilarity
+#                non_threatened threatened naturalized        all
+# non_threatened     0.00000000  0.2054555   0.4574699 0.06724445
+# threatened         0.20545550  0.0000000   0.5112286 0.14855485
+# naturalized        0.45746989  0.5112286   0.0000000 0.44370181
+# all                0.06724445  0.1485549   0.4437018 0.00000000
+# 
+# $communities$P_shared
+#                non_threatened threatened naturalized all
+# non_threatened             NA  0.9877192   0.9907174   1
+# threatened          0.9877192         NA   0.9549014   1
+# naturalized         0.9907174  0.9549014          NA   1
+# all                 1.0000000  1.0000000   1.0000000  NA
+# 
+# $communities$P_non_shared
+#                non_threatened threatened naturalized all
+# non_threatened             NA 0.01228085  0.00928264   0
+# threatened         0.01228085         NA  0.04509860   0
+# naturalized        0.00928264 0.04509860          NA   0
+# all                0.00000000 0.00000000  0.00000000  NA
+
+
+###############
+env1Edges <- unique(env_TPDc$data$evaluation_grid[, 1])
+env2Edges <- unique(env_TPDc$data$evaluation_grid[, 2])
+env.imageMat <- imageTPD(env_TPDc, thresholdPlot = 0.9999)
+env.imageMat1 <- as.data.frame(env.imageMat) |> 
+  rownames_to_column(var = "x") |> 
+  pivot_longer(cols = -contains("x"), names_to = "tmp", values_to = "z") |> 
+  filter(!is.na(z)) |> 
+  separate(col = tmp, into = c("y", "grp"), sep = "\\.(?=[^.]+$)") |> 
+  mutate(x = as.numeric(x), y = as.numeric(y))
+
+env.imageMat1.grp <- filter(env.imageMat1, grp != "all") |> 
+  mutate(grp = factor(grp, levels = c("non_threatened", "threatened","naturalized")))
+env.imageMat1.all <- filter(env.imageMat1, grp == "all")
+
+######################
+par(mfrow = c(1, 3))
+map(c("threatened", "non_threatened", "naturalized"), function(nm){
+  image(x=env1Edges, y=env2Edges, z=env.imageMat[, , nm], 
+         xaxs="r", yaxs="r",  
+      main = nm,
+      xlim = c(-20, 10), ylim = c(-10, 12),
+      asp = 1)
+  contour(x=env1Edges, y=env2Edges, z=env.imageMat[, , nm], levels=0.5,
+          drawlabels = F, lwd=2,  col="white", add=T)
+  contour(x=env1Edges, y=env2Edges, z=env.imageMat[, , "all"], levels=0.99,
+         drawlabels = F, lwd=2,  col="blue", add=T)
+  
+})
+par(mfrow = c(1, 1))
+#####################
+env.imageMat1.grp |> 
+  ggplot() +
+  geom_raster(aes(x = x, y = y, fill = val)) +
+  geom_contour(breaks = 0.5, color = "white", aes(x = x, y = y, z = val)) +
+  facet_grid(. ~ grp) +
+  # geom_contour(aes(x = x, y = y, z = val),
+  #              data = filter(env.imageMat1, grp == "all"),
+  #              breaks = 0.95, color = "grey50", linetype = "dashed", size = 1.2) +
+  annotate(geom = "contour", fill = NA,
+           x = env.imageMat1.all$x,
+           y = env.imageMat1.all$y,
+           z = env.imageMat1.all$val,
+           breaks = 0.95, color = "grey50", linetype = "dashed", size = 1.2) +
+  xlim(-20, 10) +
+  ylim(-10, 12) +
+  theme_minimal() +
+  theme(aspect.ratio = 1)
+
+env.imageMat1 |> 
+  ggplot() +
+  geom_raster(aes(x = x, y = y, fill = val)) +
+  geom_contour(breaks =0.95, color = "black", aes(x = x, y = y, z = val)) +
+  facet_grid(. ~ grp) +
+  # geom_contour(aes(x = x, y = y, z = val),
+  #              data = filter(env.imageMat1, grp == "all"),
+  #              breaks = 0.95, color = "grey50", linetype = "dashed", size = 1.2) +
+  xlim(-20, 10) +
+  ylim(-10, 12) +
+  theme_minimal() +
+  theme(aspect.ratio = 1)
+
+
+```
+
+# 3. data analyses for future species list
+
+## 3.1 future naturalized species (DAPC analyses)
+
+identify naturalized-like non_threatened species based on vulnerability, economic use and area, possible way is to conduct clustering analysis
+
+```{r}
+df4cluster <- tree_gtc16_group_final2 |> 
+  filter(taxon_name %in% tree_phy.f$tip.label) |> 
+  filter(red_naturalized1 != "threatened") |> 
+  select(taxon_name, red_naturalized1, all_of(vul.nm))
+
+
+vul.dapc <- dapc(df4cluster[, -c(1:2, 4)], grp = df4cluster$red_naturalized1,
+                 n.pca = 7, n.da = 7)
+
+summary(vul.dapc)
+vul.dapc$var.contr
+vul.dapc$assign
+# slope_fire, rate_cropland, and use_sum contribute the most
+
+bind_cols(df4cluster[, 1:2], as.data.frame(vul.dapc$posterior)) |> 
+  filter(red_naturalized1 == "non_threatened") |> 
+  filter(naturalized >= 0.9) |> pull(naturalized) |> range()
+
+# 0.9: 202 non_threatened species are more alike as naturalized species 
+# 0.8: 364 non_threatened species are more alike as naturalized species 
+
+bind_cols(df4cluster[, 1:2], as.data.frame(vul.dapc$posterior)) |> 
+  filter(red_naturalized1 == "naturalized") |> 
+  filter(non_threatened >= 0.8)
+
+bind_cols(df4cluster[, 1:2], 
+          as.data.frame(vul.dapc$posterior),
+          posterior.assign = vul.dapc$assign) |> 
+  write.table("vul.dapc.txt")
+
+vul.dapc$eig / sum(vul.dapc$eig)
+
+###############
+naturalized_alike <- bind_cols(df4cluster[, 1:2], posterior.assign = vul.dapc$assign) |> 
+  filter(red_naturalized1 == "non_threatened" & posterior.assign == "naturalized") |> 
+  pull(taxon_name)
+#771 non_threatened species are assigned as naturalized species
+
+###################
+# check if DCPA models works properly
+vul.dapc1 <- xvalDapc(
+  df4cluster[, -c(1:2, 4)],
+  grp = df4cluster$red_naturalized1,
+  n.pca.max = 11,
+  training.set = 0.8,
+  result = "groupMean",
+  center = TRUE,
+  scale = FALSE,
+  n.rep = 20
+)
+vul.dapc1$`Mean Successful Assignment by Number of PCs of PCA`
+
+# Extract data for plotting
+dapc4p <- bind_cols(df4cluster[, 1:2], da.fun = vul.dapc$ind.coord, da.grp = vul.dapc$assign) |>
+  mutate(grp = ifelse(red_naturalized1 == "non_threatened" & da.grp == "naturalized",
+                      "naturalized_alike", red_naturalized1))
+
+p1 <- ggplot(dapc4p, aes(x = da.fun, y = 1, fill = red_naturalized1, color = red_naturalized1)) +
+  geom_density_ridges(alpha = 0.3) +
+  scale_color_manual(values = col_final) +
+  scale_fill_manual(values = col_final) +
+  guides(color = guide_legend(title = NULL),
+         fill = guide_legend(title = NULL)
+         ) +
+  xlab("Discriminant function 1") +
+  ylab("Density") +
+  theme_bw() +
+  theme(legend.position = c(0.8, 0.8))
+
+p2 <- ggplot(dapc4p, aes(x = da.fun, y = 1, fill = grp, color = grp)) +
+  geom_density_ridges(alpha = 0.3) +
+  scale_color_manual(values = c(col_final, "naturalized_alike" = "black")) +
+  scale_fill_manual(values = c(col_final, "naturalized_alike" = "black")) +
+  guides(color = guide_legend(title = NULL),
+         fill = guide_legend(title = NULL)
+         ) +
+  xlab("Discriminant function 1") +
+  ylab("Density") +
+  theme_bw() +
+  theme(legend.position = c(0.8, 0.8))
+p1 / p2
+######################
+vul.pca <- PCA(df4cluster[, -c(1:2, 4)], graph = F)
+vul.pca.coord <- bind_cols(df4cluster[, 1:2], vul.pca$ind$coord, da.grp = vul.dapc$assign) |> 
+  mutate(grp = ifelse(red_naturalized1 == "non_threatened" & da.grp == "naturalized",
+                      "naturalized_alike", red_naturalized1))
+
+ggplot(vul.pca.coord, aes(x = Dim.1, y = Dim.2, color = red_naturalized1)) +
+  # ggrastr::geom_point_rast(shape = 21, size = 2, fill = NA) +
+  geom_point(shape = 21, size = 2, fill = NA) +
+  scale_color_manual(values = col_final) +
+  xlim(c(-6, 6)) +
+  theme_bw()
+
+ggplot(vul.pca.coord, aes(x = Dim.1, y = Dim.2, color = grp)) +
+  # ggrastr::geom_point_rast(shape = 21, size = 2, fill = NA) +
+  geom_point(shape = 21, size = 2, fill = NA) +
+  scale_color_manual(values = c(col_final, "naturalized_alike" = "black") )+
+  xlim(c(-6, 6)) +
+  theme_bw()
+
+
+
+#####################
+ggplot(dapc4p, aes(x = da.fun, y = 1, fill = red_naturalized1))+
+  stat_density_ridges(
+    geom = "density_ridges_gradient", 
+    calc_ecdf = TRUE,
+    quantiles = c(0.1, 0.5, 0.9), 
+    # color = NA,
+    quantile_lines = F
+  ) +
+  xlab(NULL) +
+  ylab(NULL) +
+  scale_fill_viridis_d(name = "Probability",
+                       option = "E",
+                       labels = c("(0, 0.1]", 
+                                  "(0.1, 0.5]", 
+                                  "(0.5, 0.9]",
+                                  "(0.9, 1]") ) +
+  theme_bw()
+
+```
+
+## 3.2 future extinction
+
+### 3.2.1 some inspection
+
+```{r}
+tree_gtc16_group_final2 |> 
+  filter(taxon_name %in% tree_phy.f$tip.label) |> 
+  filter(!(taxon_name %in% naturalized_alike)) |> 
+  filter(red_naturalized1 != "naturalized") |> 
+  select(taxon_name, red_naturalized1, IUCN.category, red_type, IUCNstatus) |> 
+  filter(is.na(IUCN.category))
+
+tree_gtc16_group_final2 |> 
+  # ICUN.category = data derived from IUCN
+  # red_naturalized = data after merging with GloNAF
+  # red_naturalized1 = data after merging with GloNAF, extinction risk
+  count(IUCN.category, red_naturalized, red_naturalized1)
+
+```
+
+### 3.2.2 prepare data: apply future extinction scenario
+
+```{r}
+# for those are not naturalized-alike non-threatened species, apply future extinction scenario based on Cooke et al., 2019 NC. Projected losses of global mammal and bird ecological strategies
+
+# first, need to add IUCN category to those with missing classification
+# best scenario: set all non_threatened species as LC, and all threatened as VU
+# worst scenario: set all non_threatened species as NT, and all threatened as CR
+future_ext <- tree_gtc16_group_final2 |> 
+  filter(!(taxon_name %in% miss.tree.nm)) |> 
+  filter(red_naturalized1 != "naturalized") |> 
+  filter(!(taxon_name %in% naturalized_alike)) |> 
+  mutate(best_IUCN = case_when(!(taxon_name %in% naturalized_alike) & 
+                                 red_naturalized == "missing" &
+                                 red_naturalized1 == "non_threatened" ~ "LC",
+                               !(taxon_name %in% naturalized_alike) & 
+                                 red_naturalized == "missing" &
+                                 red_naturalized1 == "threatened" ~ "VU",
+                               .default = IUCN.category
+                                 ) ) |> 
+    mutate(worst_IUCN = case_when(!(taxon_name %in% naturalized_alike) & 
+                                 red_naturalized == "missing" &
+                                 red_naturalized1 == "non_threatened" ~ "NT",
+                               !(taxon_name %in% naturalized_alike) & 
+                                 red_naturalized == "missing" &
+                                 red_naturalized1 == "threatened" ~ "CR",
+                               .default = IUCN.category
+                                 ) )
+
+future_ext |> count(red_naturalized1)
+future_ext |> count(red_naturalized1, best_IUCN)
+future_ext |> count(red_naturalized1, worst_IUCN)
+
+# for those are NA or, NE, or DD in best_IUCN or worst_IUCN, also apply the above scenario
+future_ext1 <- future_ext |> 
+  mutate(best_IUCN1 = case_when(red_naturalized1 == "non_threatened" &
+                                (best_IUCN == "NE" | is.na(best_IUCN)) ~ "LC",
+                                red_naturalized1 == "threatened" &
+                                (best_IUCN == "NE" | is.na(best_IUCN)) ~ "VU",
+                                .default = best_IUCN
+                                  )) |> 
+    mutate(worst_IUCN1 = case_when(red_naturalized1 == "non_threatened" &
+                                (worst_IUCN == "NE" | is.na(worst_IUCN)) ~ "LC",
+                                red_naturalized1 == "threatened" &
+                                (worst_IUCN == "NE" | is.na(worst_IUCN)) ~ "VU",
+                                .default = worst_IUCN
+                                  ))
+
+future_ext1 |> count(red_naturalized1, best_IUCN1)
+future_ext1 |> count(red_naturalized1, worst_IUCN1)
+
+#######################
+ext.ratio <- c(0.0001, 0.01, 0.1, 0.667, 0.999, 1, 1)
+names(ext.ratio) <- c("LC", "NT", "VU", "EN", "CR", "EW", "EX")
+# apply prediction
+best_ext <- future_ext1 |> 
+  select(taxon_name,red_naturalized1, best_IUCN1) |> 
+  nest_by(red_naturalized1, best_IUCN1) |>
+  ungroup() |> 
+  mutate(ratio = ext.ratio[best_IUCN1]) |> 
+  slice(rep(1:7, 100)) |> 
+  mutate(rep = rep(1:100, each = 7) ) |> 
+  mutate(pred.ext = map2(data, ratio, ~ sample(.x$taxon_name, 
+                                               size = round(nrow(.x) * (1-.y)))))
+
+worst_ext <- future_ext1 |> 
+  select(taxon_name, red_naturalized1, worst_IUCN1) |> 
+  nest_by(red_naturalized1, worst_IUCN1) |>
+  ungroup() |> 
+  mutate(ratio = ext.ratio[worst_IUCN1]) |> 
+  slice(rep(1:7, 100)) |> 
+  mutate(rep = rep(1:100, each = 7) ) |> 
+  mutate(pred.ext = map2(data, ratio, ~ sample(.x$taxon_name, 
+                                               size = round(nrow(.x) * (1-.y)))))
+# combine best and worst ext
+pred_ext <- tibble(type = c("best", "worst"),
+       df = map(list(best_ext, worst_ext), ~ select(.x, rep, red_naturalized1, pred.ext))
+       ) |> 
+  unnest(df) |> 
+  nest_by(type, rep, red_naturalized1) |> 
+  ungroup() |> 
+  mutate(taxon_ls = map(data, ~ reduce(.x$pred.ext, c))) |> 
+  select(-data) |> 
+  pivot_wider(names_from = red_naturalized1, values_from = taxon_ls)
+
+pred_ext |> filter(type == "worst")
+pred_ext |> filter(type == "best")
+
+
+################## 
+# construct data from future scenario
+future_nat <- c(naturalized_alike, 
+                filter(df4pca$df[[1]], red_naturalized1 == "naturalized") |>
+                  pull(taxon_name) )
+df4future <- pred_ext |> 
+  mutate(naturalized = list(future_nat)) 
+
+# saveRDS(df4future, file = "df4future.RDS")
+# df4future <- readRDS("./res/df4future.RDS")
+df4future1 <- pmap(list(df4future$non_threatened, 
+                        df4future$threatened, 
+                        df4future$naturalized),
+                   function(x, y, z){
+                     
+  tibble(red_naturalized1 = c("non_threatened", "threatened", "naturalized"),
+         taxon_name = list(x, y, z) ) |>
+  unnest(taxon_name) |> 
+  left_join(tree_gtc16_group_final2 |> select(-red_naturalized1), by = "taxon_name")
+                       
+})
+
+df4future1 |> map(dim)
+
+df4future1[[1]]
+
+```
+
+# 4. future TPD
+## 4.1 future TPD calculation (see rand_extinction for details)
+
+## 4.2 quantile changes for threatened and non-threatened species
+
+```{r}
+df4future <- readRDS("df4future.RDS")
+randTPD.mean <- df4future |> 
+  select(type) |>
+  distinct(type) |>
+  slice(rep(1:2, 2)) |> 
+  mutate(traitORenv = rep(c("trait", "env"), each = 2)) |> 
+  mutate(rand.mean = map2(type, traitORenv, function(tmp1, tmp2){
+    tmp <- map_chr(1:100, function(n){
+       trait.nm <- paste0("./rand_extinction.imageTPD/", tmp1, "_rep",n , "_rand.", tmp2,"TPDimg.RDS")
+    })
+    tmp <- map(tmp, readRDS)
+    tmp.mean <- Reduce("+", tmp) / 100
+  })) 
+
+imageMat[,, -4] - randTPD.mean$rand.nm[[1]]
+
+randTPD.change <- randTPD.mean |> 
+  # changes
+  mutate(currentTPD = list(imageMat[,, -4], env.imageMat[,, -4])[rep(1:2, each = 2)]) |> 
+  mutate(TPDchange = map2(currentTPD, rand.mean, ~ .x - .y))
+range(randTPD.change$TPDchange[[3]], na.rm = T)
+
+# saveRDS(randTPD.change, file = "./randTPD.change.RDS")
+
+#######################
+randTPD.change1 <- randTPD.change |>
+  select(type, traitORenv, TPDchange) |>
+  mutate(tmp = map(TPDchange, function(tmp.df) {
+    tmp.df |>
+      as.data.frame() |>
+      rownames_to_column(var = "x") |>
+      pivot_longer(
+        cols = -contains("x"),
+        names_to = "tmp",
+        values_to = "z"
+      ) |>
+      filter(!is.na(z)) |>
+      separate(col = tmp,
+               into = c("y", "grp"),
+               sep = "\\.(?=[^.]+$)") |>
+      mutate(x = as.numeric(x), y = as.numeric(y))
+  })) |> 
+  select(-TPDchange) 
+ 
+
+trait.lim <- list(xlim = c(-8, 8), ylim = c(-5, 7))
+env.lim <-  list(xlim = c(-21, 12), ylim = c(-12, 14))
+
+randTPD.change1 |> 
+  unnest(tmp) |> 
+  # for naturalized species, focused on the positive changes (due to increased species number)
+  # for non-threatend and threatened species, focused on the negative changes (due to species loss)
+  mutate(tmp = case_when((grp == "naturalized" & z > 0) ~ 1,
+                         (grp != "naturalized" & z < 0) ~ 1,
+                         .default = 0,
+                         )) |> 
+  filter(tmp ==1) |> 
+  mutate(z = z*100) |> 
+  nest_by(type, traitORenv, grp) |> 
+  ungroup() |> 
+  slice(-c(7, 10)) |> 
+  unnest(data) |> 
+  ungroup() |> 
+  ggplot(aes(x = grp, y = z, color = grp)) +
+  geom_boxplot(width = 0.4) +
+  facet_nested(traitORenv ~  type + grp, scales = "free", independent = "y") +
+  theme_minimal()
+
+# overall difference seems not very intuitive
+#######################
+randTPD.change1 <- randTPD.change |>
+  select(type, traitORenv, TPDchange) |>
+  mutate(tmp = map(TPDchange, function(tmp.df) {
+    tmp.df |>
+      as.data.frame() |>
+      rownames_to_column(var = "x") |>
+      pivot_longer(
+        cols = -contains("x"),
+        names_to = "tmp",
+        values_to = "z"
+      ) |>
+      filter(!is.na(z)) |>
+      separate(col = tmp,
+               into = c("y", "grp"),
+               sep = "\\.(?=[^.]+$)") |>
+      mutate(x = as.numeric(x), y = as.numeric(y))
+  })) |> 
+  select(-TPDchange) 
+ 
+
+trait.lim <- list(xlim = c(-8, 8), ylim = c(-5, 7))
+env.lim <-  list(xlim = c(-21, 12), ylim = c(-12, 14))
+
+randTPD.change2 <- randTPD.change1 |> 
+  unnest(tmp) |> 
+  mutate(z = z*100) |> 
+  nest_by(type, traitORenv, grp) |> 
+  ungroup() |> 
+  slice(-c(7, 10)) |> 
+  unnest(data) |> 
+  nest_by(traitORenv, grp, .keep = T) |> 
+  ungroup() |> 
+  mutate(p = map(data, function(df){
+  tmp.p <- 
+    ggplot(df, aes(x = x, y = y)) +
+    geom_tile(aes(fill = z)) +
+    facet_wrap(. ~ type) +  #, strip.position = "left"
+    scale_fill_gradient2(low = "#590007", mid = "#EBE5E0",high = "#001260")+
+    labs(fill = "Quantile \n change") +
+    # coord_fixed() +
+    theme_minimal() +
+    theme(strip.background = element_rect(fill = "grey", color = NA)) +
+    theme(legend.position = "right") +
+    theme(panel.grid = element_blank()) +
+    theme(panel.border = element_rect(color = "grey", fill = NA)) +
+    theme(strip.placement = "outside") +
+  theme(axis.ticks = element_line()) +
+    theme(
+      legend.key.height = unit(0.6, 'cm'), #change legend key height
+      legend.key.width = unit(0.2, 'cm'), #change legend key width
+      legend.title = element_text(size=9), #change legend title font size
+      legend.text = element_text(size=8)) #change legend text font size
+  if (df$traitORenv[[1]] == "trait" ) {
+   tmp.p <-  tmp.p +
+      geom_contour(aes(x = x, y = y, z = z), 
+                   color = "black", breaks = 0.99,
+                   linetype = "dashed",
+                   linewidth = 0.1,
+                   data = filter(imageMat1, grp == "all"),
+                   inherit.aes = F
+                      ) +
+      geom_contour(aes(x = x, y = y, z = z), 
+                   color = "red", breaks = 0.5,
+                   linewidth = 0.2,
+                   data = filter(imageMat1, grp == df$grp[1]),
+                   inherit.aes = F
+                      ) +
+     geom_contour(aes(x = x, y = y, z = z), 
+                   color = "black", breaks =  0.95,
+                   linewidth = 0.1,
+                   data = filter(imageMat1, grp == df$grp[1]),
+                   inherit.aes = F
+                      ) +
+      xlim(trait.lim$xlim) +
+      ylim(trait.lim$ylim) +
+      xlab("PC1 (40.68%)") +
+      ylab("PC2 (19.82%)")
+  } else {
+    tmp.p <- tmp.p +
+      geom_contour(aes(x = x, y = y, z = z), 
+                   color = "black", 
+                   breaks = 0.99,
+                   linetype = "dashed",
+                   linewidth = 0.1,
+                      data = filter(env.imageMat1, grp == "all"),
+                      inherit.aes = F
+                      ) +
+            geom_contour(aes(x = x, y = y, z = z), 
+                   color = "red", breaks =  0.5,
+                   linewidth = 0.2,
+                   data = filter(env.imageMat1, grp == df$grp[1]),
+                   inherit.aes = F
+                      ) +
+      geom_contour(aes(x = x, y = y, z = z), 
+                   color = "black", breaks =  0.95,
+                   linewidth = 0.1,
+                   data = filter(env.imageMat1, grp == df$grp[1]),
+                   inherit.aes = F
+                      ) +
+      xlim(env.lim$xlim) +
+      ylim(env.lim$ylim) +
+      xlab("PC1 (40.23%)") +
+      ylab("PC2 (26.52%)")
+
+  }
+  
+  # delete strip for naturalized species
+  if (df$grp[[1]] == "naturalized"){
+    tmp.p <- tmp.p +
+      theme(strip.background = element_blank()) +
+      theme(strip.text = element_blank())
+    
+  }
+  
+  return(tmp.p)
+    
+  }) ) 
+
+# randTPD.change2
+randTPD.change2$p[[4]]
+# if(run_documentation()) {
+# plot_gg(randTPD.change2$p[[4]], preview = TRUE)
+# }
+
+# # naturalized species
+# TPD.change.p1 <- plot_grid(plotlist = randTPD.change2$p[c(4, 1)], nrow = 1, hjust = -0.2, vjust = 1,
+#           labels = c("a) [Naturalized species] changes in trait space",
+#                      "b) [Naturalized species] changes in environmental space"), 
+#           label_size = 8)
+# 
+# # non_threatened species
+# TPD.change.p2 <- plot_grid(plotlist = randTPD.change2$p[c(5, 2)], nrow = 2,  hjust = -0.2, vjust = 1,
+#           labels = c("c) [Non-threatened species] changes in trait space",
+#                      "d) [Non-threatened species] changes in environmental space"), 
+#           label_size = 8)
+# 
+# # threatened species
+# TPD.change.p3 <- plot_grid(plotlist = randTPD.change2$p[c(6, 3)], nrow = 2,  hjust = -0.2, vjust = 1,
+#           labels = c("e) [threatened species] changes in trait space",
+#                      "f) [threatened species] changes in environmental space"), label_size = 8)
+# 
+# 
+# pdf(".non-threatened&threatened.TPDchanges.v1.pdf",  height = 8, width = 5)
+# # TPD.change.p1
+# # TPD.change.p2
+# # TPD.change.p3
+# plot_grid(TPD.change.p2, TPD.change.p3, nrow = 2)
+# dev.off()
+# 
+# pdf(".naturalized.TPDchanges.v1.pdf",  height = 3, width = 8)
+# TPD.change.p1
+# dev.off()
+
+
+```
+
+## 4.3 net TPD changes (future TPD - current TPD) Fig.2
+
+```{r}
+randTPD.change$TPDchange
+
+netchange <- randTPD.change |> 
+  mutate(net_chg.avg = map(TPDchange, ~ apply(.x, c(1,2), function(x)mean(x, na.rm = T)))) |> 
+  mutate(net_chg.sum = map(TPDchange, ~ apply(.x, c(1,2), function(x)sum(x, na.rm = T)))) |> 
+  mutate(net_chg.abs_sum = map(TPDchange, ~ apply(.x, c(1,2), function(x)sum(abs(x), na.rm = T)))) |> 
+  pivot_longer(cols = net_chg.avg:net_chg.abs_sum, names_to = "metrics", values_to = "net_chg") |> 
+  mutate(net_chg = map(net_chg, function(x){
+    as.data.frame(x) |> 
+       rownames_to_column(var = "x") |> 
+       pivot_longer(cols = -contains("x"), names_to = "y", values_to = "z") |> 
+       filter(!is.na(z)) |> 
+       mutate(x = as.numeric(x), y = as.numeric(y))
+  })) |> 
+  select(type, metrics, traitORenv, net_chg) |> 
+  filter(metrics == "net_chg.sum") |> 
+  unnest(net_chg)
+
+trait.netchg <- netchange |> 
+  filter(traitORenv == "trait") |>  #pull(z) |> range()
+  ggplot(aes(x = x, y = y, z = z)) +
+  geom_tile(aes(fill = z)) +
+  scale_fill_gradient2(
+    low = "red", 
+    mid = "white",
+    high = "#001260",
+    midpoint = 0,
+    oob = scales::squish,
+    limits = c(-0.3, 0.3),
+    breaks = c(-0.3, -0.2, -0.1, -0, 0.1, 0.2, 0.3),  # Set the breaks of the legend
+    labels = c("-0.3", "-0.2", "-0.1", "0", "0.1", "0.2", "0.3"),
+    name = "Quantile \n change"
+  ) +
+  facet_grid(. ~ type) +
+  theme_minimal() +
+  theme(strip.background = element_rect(fill = "grey", color = NA)) +
+  theme(legend.position = "right") +
+  theme(panel.grid = element_blank()) +
+  theme(panel.border = element_rect(color = "grey", fill = NA)) +
+  theme(strip.placement = "outside") +
+  theme(
+    legend.key.height = unit(0.6, 'cm'),
+    #change legend key height
+    legend.key.width = unit(0.1, 'cm'),
+    #change legend key width
+    legend.title = element_text(size = 9),
+    #change legend title font size
+    legend.text = element_text(size = 8)
+  ) + #change legend text font size
+  
+  geom_contour(
+    aes(x = x, y = y, z = z),
+    color = "black",
+    breaks = 0.99,
+    linetype = "dashed",
+    linewidth = 0.1,
+    data = filter(imageMat1, grp == "all"),
+    inherit.aes = F
+  ) +
+  xlim(c(-8, 8)) +
+  ylim(c(-5, 7)) +
+  xlab("PC1 (40.68%)") +
+  ylab("PC2 (19.82%)") +
+  theme(axis.ticks = element_line()) +
+  ggtitle("a) Functional space")
+# trait.netchg
+custom_colors <- c("red", "white", "#001260")
+custom_values <- scales::rescale(c(-0.3, 0, 0.9))
+env.netchg <- netchange |> 
+  filter(traitORenv == "env") |> #pull(z) |> range()
+  ggplot(aes(x = x, y = y, z = z)) +
+  geom_tile(aes(fill = z)) +
+  scale_fill_gradientn(
+    colors = custom_colors,
+    values = custom_values,
+    oob = scales::squish,
+    name = "Quantile \n change",
+    limits = c(-0.3, 0.9),
+    breaks = c(-0.3, 0, 0.3, 0.6, 0.9),  # Set the breaks of the legend
+    labels = c("-0.3", "0", "0.3", "0.6", "0.9")
+  ) +
+  facet_grid(. ~ type) +
+  theme_minimal() +
+  theme(strip.background = element_rect(fill = "grey", color = NA)) +
+  theme(legend.position = "right") +
+  theme(panel.grid = element_blank()) +
+  theme(panel.border = element_rect(color = "grey", fill = NA)) +
+  theme(strip.placement = "outside") +
+  theme(
+    legend.key.height = unit(0.6, 'cm'),
+    #change legend key height
+    legend.key.width = unit(0.1, 'cm'),
+    #change legend key width
+    legend.title = element_text(size = 9),
+    #change legend title font size
+    legend.text = element_text(size = 8)
+  ) + #change legend text font size
+  
+  geom_contour(
+    aes(x = x, y = y, z = z),
+    color = "black",
+    breaks = 0.99,
+    linetype = "dashed",
+    linewidth = 0.1,
+    data = filter(env.imageMat1, grp == "all"),
+    inherit.aes = F
+  ) +
+  xlim(env.lim$xlim) +
+  ylim(env.lim$ylim) +
+  xlab("PC1 (40.23%)") +
+  ylab("PC2 (26.51%)") +
+  theme(axis.ticks = element_line()) +
+  ggtitle("b) Environmental space")
+env.netchg
+# pdf("./figs/net_changeTPD.multiple_metrics.pdf", width = 5, height = 10)
+pdf("./Fig.2.net_changeTPD.sum.pdf", width = 6, height = 6)
+plot_grid(trait.netchg, env.netchg, nrow = 2, align = "hv",
+          label_x = c(0, 0), label_y = c(1, 1),
+          labels = NULL
+          )
+dev.off()
+```
