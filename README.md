@@ -1,6 +1,6 @@
 # global_tree.fun-env.space
 
-This repository contains the materials and code for reproducing the analyses and results of the study: **XXXX**. Specifically, the repository includes scripts, data, and refined figures used for the study.
+This repository contains the materials and code for reproducing the analyses and results of the study: **Acquisitive Trees on the Rise: Global Functional Shifts Driven by Alien Naturalization and Native Extinction**. Specifically, the repository includes scripts, data, and refined figures used for the study.
 
 ---
 
